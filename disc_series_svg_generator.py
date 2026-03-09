@@ -3,14 +3,14 @@
 Disc-series SVG icon generator (CLI)
 ------------------------------------
 Creates a set of SVG icons showing N overlapping discs where:
-  • The "current" disc (i) is a plain, solid circle with text only.
-  • All other discs are stylized CDs (opaque base, rim, hub ring,
-    transparent center hole, radial highlights in two quadrants).
-  • Z-order (non-current) uses the rule:
+    • The "current" disc (i) is a plain, solid circle with text only.
+    • All other discs are stylized CDs (opaque base, rim, hub ring,
+        transparent center hole, radial highlights in two quadrants).
+    • Z-order (non-current) uses the rule:
         z(j) = j                    if j < i
         z(j) = (j - i) * -1         if j > i
-    Discs are rendered in ascending z(j) (bottom → top), then the current disc is drawn last.
-  • Adjacent discs overlap by a specified fraction of one disc’s area.
+        Discs are rendered in ascending z(j) (bottom → top), then the current disc is drawn last.
+    • Adjacent discs overlap by a specified fraction of one disc’s area.
 
 Outputs: <prefix>_<i>_of_<N>.svg for i = 1..N, and a ZIP bundle.
 """
@@ -26,11 +26,11 @@ from typing import List, Tuple
 # --------------------------- Defaults ---------------------------
 
 DEFAULTS = dict(
-    total_discs      = 6,       # N >= 2
+    total_discs      = 3,       # N >= 2
     overlap_fraction = 0.75,    # 0..1 or "NN%" via CLI
     radius_px        = 320,
     padding_px       = 80,
-    prefix           = "disc_cd_param",
+    prefix           = "disc_series",
 
     # Non-current (stylized CD)
     cd_fill          = "#F0F0F0",
@@ -41,10 +41,10 @@ DEFAULTS = dict(
     hole_ratio       = 0.12,    # center hole diameter / disc diameter
 
     # Highlights: two opposite quadrants, each drawn at two radii
-    hl_color         = "rgba(255,255,255,0.28)",
+    hl_color         = "rgba(192,192,192,0.75)",
     hl_outer_w       = 36,
     hl_inner_w       = 28,
-    highlight_arcs   = [(110, 160), (290, 340)],  # UL and LR
+    highlight_arcs   = [(110, 160), (290, 340)],  # Lower-left, upper-right quadrants (degrees CCW from +X axis)
 
     # Current (top) disc = solid only
     current_fill     = "#000000",
@@ -140,7 +140,7 @@ def draw_stylized_cd(cx: float, cy: float, r: float, S: dict) -> str:
     return "\n".join(parts)
 
 def draw_current_disc(cx: float, cy: float, r: float, S: dict) -> str:
-    return f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="{r:.3f}" fill="{S["current_fill"]}" />'
+    return f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="{r:.3f}" fill="{S["current_fill"]}" stroke="{S["cd_fill"]}" stroke-width="{S["cd_outline_w"]}" />'
 
 def draw_label(cx: float, cy: float, i: int, n: int, S: dict) -> str:
     if S.get("label_mode", "two-line") == "fraction":

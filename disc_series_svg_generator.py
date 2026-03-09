@@ -26,11 +26,11 @@ from typing import List, Tuple
 # --------------------------- Defaults ---------------------------
 
 DEFAULTS = dict(
-    total_discs      = 3,       # N >= 2
-    overlap_fraction = 0.75,    # 0..1 or "NN%" via CLI
-    radius_px        = 320,
-    padding_px       = 80,
-    prefix           = "disc_series",
+    total_discs = 3,       # N >= 2
+    overlap     = 0.75,    # 0..1 or "NN%" via CLI
+    radius      = 320,
+    padding     = 80,
+    prefix      = "disc_series",
 
     # Non-current (stylized CD)
     cd_fill          = "#F0F0F0",
@@ -200,10 +200,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     d = DEFAULTS
 
     p.add_argument("--total-discs", type=int, default=d["total_discs"])
-    p.add_argument("--overlap", type=parse_fraction_or_percent, default=d["overlap_fraction"],
+    p.add_argument("--overlap", type=parse_fraction_or_percent, default=d["overlap"],
                    help="Neighbor overlap as fraction (0..1) or percent (e.g., 75%%).")
-    p.add_argument("--radius", type=float, default=d["radius_px"])
-    p.add_argument("--padding", type=int, default=d["padding_px"])
+    p.add_argument("--radius", type=float, default=d["radius"])
+    p.add_argument("--padding", type=int, default=d["padding"])
     p.add_argument("--prefix", default=d["prefix"])
 
     # Colors & strokes

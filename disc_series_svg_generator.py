@@ -115,12 +115,16 @@ def svg_header(W: int, H: int, bg: str = "none") -> str:
     )
 
 def draw_stylized_cd(cx: float, cy: float, r: float, S: dict) -> str:
-    """Opaque stylized CD with rim, hub ring, UL/LR highlights, and transparent center hole."""
+    """Opaque stylized CD with rim, hub ring, UL/LR highlights, and filled center hole."""
     parts = []
     path_ring = donut_path(cx, cy, r, r * S["hole_ratio"])
     parts.append(
         f'<path d="{path_ring}" fill="{S["cd_fill"]}" fill-rule="evenodd" '
         f'stroke="{S["cd_outline"]}" stroke-width="{S["cd_outline_w"]}" />'
+    )
+    parts.append(
+        f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="{r*S["hole_ratio"]:.3f}" '
+        f'fill="{S["cd_outline"]}" />'
     )
     parts.append(
         f'<circle cx="{cx:.3f}" cy="{cy:.3f}" r="{r*S["hub_ratio"]:.3f}" '
@@ -201,7 +205,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--total-discs", type=int, default=d["total_discs"])
     p.add_argument("--overlap", type=parse_fraction_or_percent, default=d["overlap"],
-                   help="Neighbor overlap as fraction (0..1) or percent (e.g., 75%%).")
+                    help="Neighbor overlap as fraction (0..1) or percent (e.g., 75%%).")
     p.add_argument("--radius", type=float, default=d["radius"])
     p.add_argument("--padding", type=int, default=d["padding"])
     p.add_argument("--prefix", default=d["prefix"])
@@ -218,7 +222,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--hl-outer-w", type=float, default=d["hl_outer_w"])
     p.add_argument("--hl-inner-w", type=float, default=d["hl_inner_w"])
     p.add_argument("--highlight-arcs", type=parse_highlight_arcs, default=d["highlight_arcs"],
-                   help='Quadrant arcs like "110,160;290,340"')
+                    help='Quadrant arcs like "110,160;290,340"')
 
     p.add_argument("--current-fill", default=d["current_fill"])
 

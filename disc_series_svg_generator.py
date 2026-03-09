@@ -233,6 +233,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--font-size", type=float, default=d["font_size"])
     p.add_argument("--label-mode", choices=["two-line", "fraction"], default=d["label_mode"])
 
+    p.add_argument("--zip", action="store_true", help="Create a zip file instead of individual SVG files.")
+
     return p
 
 # --------------------------- Main render ---------------------------
@@ -310,16 +312,19 @@ def main():
         svg.append('</svg>')
 
         fname = f"{args.prefix}_{i}_of_{n}.svg"
-        Path(fname).write_text("\n".join(svg), encoding="utf-8")
-        outputs.append(fname)
+        outputs.append((fname, "\n".join(svg)))
 
-    # Bundle ZIP
-    zip_name = f"{args.prefix}_set_{n}_discs.zip"
-    with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in outputs:
-            zf.write(f)
-
-    print("Created:", outputs + [zip_name])
+    # Create output: either individual SVG files or a zip file
+    if args.zip:
+        zip_name = f"{args.prefix}_set_{n}_discs.zip"
+        with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname, content in outputs:
+                zf.writestr(fname, content)
+        print("Created:", zip_name)
+    else:
+        for fname, content in outputs:
+            Path(fname).write_text(content, encoding="utf-8")
+        print("Created:", [fname for fname, _ in outputs])
 
 if __name__ == "__main__":
     main()

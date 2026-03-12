@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -33,6 +34,7 @@ from PySide6.QtCore import (
     QMimeData,
     QPoint,
     QSize,
+    QThread,
     Qt,
     Signal,
 )
@@ -49,15 +51,21 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -65,6 +73,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from resize_album_to_fit_md import (
+        OUTPUT_FORMATS as RESIZE_OUTPUT_FORMATS,
+        calculate_speed_factor,
+        check_tool as _check_ffmpeg,
+        format_duration_short as _fmt_short,
+        resize_tracks,
+    )
+    _RESIZE_AVAILABLE = _check_ffmpeg("ffmpeg") and _check_ffmpeg("ffprobe")
+except ImportError:
+    _RESIZE_AVAILABLE = False
 
 # ------------------------------------------------------------------ #
 #  Constants                                                           #
@@ -512,6 +532,154 @@ QFrame#drop_zone[dragOver="true"] {
 
 
 # ------------------------------------------------------------------ #
+#  ResizeToFitDialog — configure and run per-disc audio resize         #
+# ------------------------------------------------------------------ #
+
+
+class ResizeToFitDialog(QDialog):
+    """Dialog that lets the user configure and run a 'Resize to Fit' operation.
+
+    Opens when the user clicks the 'Resize to Fit' button on an over-capacity
+    disc.  After the user confirms, audio files are processed by ffmpeg via
+    :func:`resize_tracks` (from ``resize_album_to_fit_md``).
+    """
+
+    def __init__(self, disc: "Disc", disc_index: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.disc = disc
+        self.disc_index = disc_index
+        self.setWindowTitle(f"Resize Disc {disc_index + 1} to Fit")
+        self.setMinimumWidth(460)
+        self._output_folder: Optional[str] = None
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        # --- Info label ---
+        cap_fmt = format_duration(self.disc.config.capacity_seconds)
+        eff_fmt = format_duration(self.disc.effective_seconds)
+        over_by = self.disc.effective_seconds - self.disc.config.capacity_seconds
+        info = QLabel(
+            f"<b>Disc {self.disc_index + 1}</b> ({self.disc.config.label()}) is "
+            f"<span style='color:#f38ba8;'>over capacity</span> by "
+            f"<b>{format_duration(over_by)}</b> "
+            f"({eff_fmt} / {cap_fmt}).<br><br>"
+            "Speed up all tracks on this disc proportionally so they fit "
+            "within the disc's capacity."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # --- Speed factor preview ---
+        total_audio = self.disc.total_seconds
+        target = self.disc.config.capacity_seconds
+        factor = total_audio / target if target > 0 else 1.0
+        pct = (factor - 1) * 100
+        self._factor_label = QLabel(
+            f"Required speed factor: <b>{factor:.4f}×</b> ({pct:.2f}% faster)"
+        )
+        self._factor_label.setStyleSheet("color: #f9e2af;")
+        layout.addWidget(self._factor_label)
+
+        # --- Options group ---
+        group = QGroupBox("Options")
+        group_layout = QVBoxLayout(group)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("Speed  (pitch rises with tempo)", "Speed")
+        self._mode_combo.addItem("TimeStretch  (pitch preserved, needs librubberband)", "TimeStretch")
+        mode_row.addWidget(self._mode_combo, stretch=1)
+        group_layout.addLayout(mode_row)
+
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("Output format:"))
+        self._fmt_combo = QComboBox()
+        if _RESIZE_AVAILABLE:
+            for fmt in RESIZE_OUTPUT_FORMATS:
+                self._fmt_combo.addItem(fmt, fmt)
+        else:
+            for fmt in ("FLAC", "WAV", "AIFF", "ALAC", "APE", "WavPack", "TTA"):
+                self._fmt_combo.addItem(fmt, fmt)
+        fmt_row.addWidget(self._fmt_combo, stretch=1)
+        group_layout.addLayout(fmt_row)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Output folder:"))
+        self._folder_edit = QLineEdit()
+        self._folder_edit.setPlaceholderText("(required)")
+        self._folder_edit.setReadOnly(True)
+        folder_row.addWidget(self._folder_edit, stretch=1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._browse_folder)
+        folder_row.addWidget(browse_btn)
+        group_layout.addLayout(folder_row)
+
+        self._reload_check = QCheckBox("Reload resized tracks into this disc when done")
+        self._reload_check.setChecked(True)
+        group_layout.addWidget(self._reload_check)
+
+        layout.addWidget(group)
+
+        # --- Warning if ffmpeg unavailable ---
+        if not _RESIZE_AVAILABLE:
+            warn = QLabel(
+                "⚠  <b>ffmpeg / ffprobe not found in PATH.</b>  "
+                "Install ffmpeg to enable resizing."
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: #f38ba8; background: #313244; padding: 6px; border-radius: 4px;")
+            layout.addWidget(warn)
+
+        # --- Dialog buttons ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_btn:
+            ok_btn.setText("Resize")
+            ok_btn.setEnabled(_RESIZE_AVAILABLE)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select output folder for resized tracks"
+        )
+        if folder:
+            self._output_folder = folder
+            self._folder_edit.setText(folder)
+
+    def _on_accept(self) -> None:
+        if not self._output_folder:
+            QMessageBox.warning(
+                self,
+                "No output folder",
+                "Please select an output folder before resizing.",
+            )
+            return
+        self.accept()
+
+    # ---- Public accessors ----
+
+    def selected_mode(self) -> str:
+        return self._mode_combo.currentData() or "Speed"
+
+    def selected_format(self) -> str:
+        return self._fmt_combo.currentData() or "FLAC"
+
+    def output_folder(self) -> str:
+        return self._output_folder or ""
+
+    def reload_after(self) -> bool:
+        return self._reload_check.isChecked()
+
+
+# ------------------------------------------------------------------ #
 #  CapacityBar — custom-painted track segments                         #
 # ------------------------------------------------------------------ #
 
@@ -659,6 +827,22 @@ class DiscWidget(QFrame):
         config_row.addWidget(self._mode_combo)
 
         config_row.addStretch()
+
+        # --- Resize to Fit button (shown only when disc is over capacity) ---
+        self._resize_btn = QPushButton("\u26A1  Resize to Fit")
+        self._resize_btn.setToolTip(
+            "Speed up all tracks on this disc proportionally so they fit "
+            "within its capacity (requires ffmpeg)."
+        )
+        self._resize_btn.setStyleSheet(
+            "QPushButton { background-color: #45475a; color: #f38ba8; "
+            "border: 1px solid #f38ba8; border-radius: 6px; padding: 4px 10px; }"
+            "QPushButton:hover { background-color: #585b70; }"
+        )
+        self._resize_btn.clicked.connect(self._on_resize_clicked)
+        self._resize_btn.setVisible(False)
+        config_row.addWidget(self._resize_btn)
+
         layout.addLayout(config_row)
 
     def _on_config_change(self) -> None:
@@ -706,6 +890,99 @@ class DiscWidget(QFrame):
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, id(track))
             self._track_list.addItem(item)
+
+        # Show Resize-to-Fit button only when disc is over capacity
+        self._resize_btn.setVisible(disc.is_over and _RESIZE_AVAILABLE)
+
+    # ---- Resize to Fit ----
+
+    def _on_resize_clicked(self) -> None:
+        """Open the Resize-to-Fit dialog and run the resize if confirmed."""
+        dialog = ResizeToFitDialog(self.disc, self.disc_index, parent=self.window())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        output_folder = dialog.output_folder()
+        mode = dialog.selected_mode()
+        fmt = dialog.selected_format()
+        do_reload = dialog.reload_after()
+
+        # Gather the source files from this disc's tracks
+        input_files = [Path(t.path) for t in self.disc.tracks]
+        if not input_files:
+            return
+
+        # Calculate the speed factor from raw audio seconds vs disc capacity
+        total_audio = self.disc.total_seconds
+        target = self.disc.config.capacity_seconds
+        if target <= 0 or total_audio <= target:
+            return
+        speed_factor = total_audio / target
+
+        # Run resize in a background thread to keep the UI responsive
+        results_holder: list = [None]
+        done_event = threading.Event()
+
+        def _worker() -> None:
+            try:
+                results_holder[0] = resize_tracks(
+                    input_files,
+                    output_folder,
+                    speed_factor,
+                    mode=mode,
+                    output_format=fmt,
+                    quiet=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — intentionally broad; background worker must not crash silently
+                results_holder[0] = exc
+            finally:
+                done_event.set()
+
+        worker_thread = threading.Thread(target=_worker, daemon=True)
+        worker_thread.start()
+
+        progress = QProgressDialog(
+            f"Resizing {len(input_files)} track(s) for Disc {self.disc_index + 1}…",
+            None,  # no cancel button
+            0, 0,
+            self.window(),
+        )
+        progress.setWindowTitle("Resizing Tracks")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+
+        while not done_event.wait(timeout=0.05):
+            QApplication.processEvents()
+
+        progress.close()
+
+        raw = results_holder[0]
+        if isinstance(raw, Exception):
+            QMessageBox.critical(
+                self.window(),
+                "Resize failed",
+                f"An error occurred during resizing:\n{raw}",
+            )
+            return
+
+        results = raw  # list of (output_path, duration_or_None)
+        failed = [p for p, d in results if d is None]
+        if failed:
+            QMessageBox.warning(
+                self.window(),
+                "Some tracks failed",
+                "The following tracks could not be resized:\n"
+                + "\n".join(f"  • {Path(p).name}" for p in failed),
+            )
+
+        successful_paths = [p for p, d in results if d is not None]
+        if not successful_paths:
+            return
+
+        if do_reload:
+            window = self.window()
+            if isinstance(window, PlaylistSplitterApp):
+                window.reload_resized_disc(self.disc_index, successful_paths)
 
     # ---- Drag-and-drop between discs ----
 
@@ -1093,6 +1370,47 @@ class PlaylistSplitterApp(QMainWindow):
         for dw in self._disc_widgets:
             dw.refresh()
         self._update_summary()
+
+    def reload_resized_disc(self, disc_index: int, new_paths: List[str]) -> None:
+        """Replace the tracks on *disc_index* with the resized files at *new_paths*.
+
+        Called after a successful 'Resize to Fit' operation when the user has
+        opted to reload the resized tracks into the disc.
+        """
+        if disc_index >= len(self._disc_widgets):
+            return
+
+        new_tracks, errors = scan_audio_files(new_paths)
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Some resized tracks could not be loaded",
+                "\n".join(errors[:15])
+                + ("\n\u2026and more." if len(errors) > 15 else ""),
+            )
+
+        if not new_tracks:
+            return
+
+        self._save_undo()
+        dw = self._disc_widgets[disc_index]
+        dw.disc.tracks = new_tracks
+
+        # Also update the global track list so undo/re-split stay consistent
+        all_tracks: List[Track] = []
+        for widget in self._disc_widgets:
+            all_tracks.extend(widget.disc.tracks)
+        self._tracks = all_tracks
+
+        dw.refresh()
+        self._update_summary()
+
+        QMessageBox.information(
+            self,
+            "Reload complete",
+            f"Disc {disc_index + 1} has been updated with {len(new_tracks)} "
+            "resized track(s).",
+        )
 
     def _delete_selected(self) -> None:
         """Delete selected tracks from whichever disc they're on."""

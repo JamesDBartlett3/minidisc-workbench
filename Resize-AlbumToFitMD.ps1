@@ -1,15 +1,19 @@
 
 <#
 .SYNOPSIS
-Resizes (speeds up) album tracks proportionally to fit within an 80-minute CD limit.
+Resizes (speeds up) album tracks proportionally to fit on a MiniDisc.
 
 .DESCRIPTION
 Takes a folder of audio tracks and shortens each one by the same ratio so
-the total playtime fits on a standard 80-minute CD. Supports two modes:
+the total playtime fits on a MiniDisc. Supports two modes:
   - Speed mode: Increases playback speed (also raises pitch)
   - TimeStretch mode: Increases playback speed without changing pitch
 
-Output is lossless FLAC by default. Other lossless formats with metadata support:
+Standard MiniDiscs hold 74 minutes in SP (standard play) mode.
+Use -LP2 to double capacity (160 minutes) or -LP4 to quadruple it
+(320 minutes), matching MDLP Long Play recording modes.
+
+Output is lossless FLAC by default. Other lossless formats:
   - WAV, AIFF, ALAC (Apple Lossless), APE (Monkey's Audio), WavPack, or TTA (True Audio).
 
 .REQUIREMENTS
@@ -22,7 +26,14 @@ Path to folder containing the audio tracks to resize (speed up).
 Path to folder where resized tracks will be saved. Defaults to ".\Output".
 
 .PARAMETER TargetMinutes
-Target total playtime in minutes. Defaults to 80 (standard CD limit).
+Base disc capacity in minutes. Defaults to 74 (standard MiniDisc).
+This value is multiplied by 2 when -LP2 is specified, or by 4 when -LP4 is specified.
+
+.PARAMETER LP2
+Switch to enable MDLP LP2 mode, doubling the effective disc capacity (2x TargetMinutes).
+
+.PARAMETER LP4
+Switch to enable MDLP LP4 mode, quadrupling the effective disc capacity (4x TargetMinutes).
 
 .PARAMETER Mode
 Processing mode:
@@ -30,7 +41,7 @@ Processing mode:
   - TimeStretch: Increases speed without changing pitch (uses rubberband filter)
 
 .PARAMETER OutputFormat
-Output format (all lossless with metadata support):
+Output format (all lossless):
   - FLAC: Free Lossless Audio Codec (default)
   - WAV: Waveform Audio File Format
   - AIFF: Audio Interchange File Format
@@ -43,16 +54,20 @@ Output format (all lossless with metadata support):
 Glob pattern to match input files. Defaults to common audio extensions.
 
 .EXAMPLE
-.\Resize-AlbumToFitCD.ps1 -InputFolder ".\MyAlbum" -Mode Speed
-# Speeds up all tracks proportionally to fit in 80 minutes
+.\Resize-AlbumToFitMD.ps1 -InputFolder ".\MyAlbum" -Mode Speed
+# Speeds up all tracks proportionally to fit on a standard 74-minute MiniDisc
 
 .EXAMPLE
-.\Resize-AlbumToFitCD.ps1 -InputFolder ".\MyAlbum" -Mode TimeStretch -OutputFormat WAV
-# Time-stretches tracks without pitch change, outputs as WAV
+.\Resize-AlbumToFitMD.ps1 -InputFolder ".\MyAlbum" -LP2 -Mode TimeStretch
+# Fit onto a MiniDisc in LP2 mode (160 minutes) using time-stretch
 
 .EXAMPLE
-.\Resize-AlbumToFitCD.ps1 -InputFolder ".\MyAlbum" -TargetMinutes 74 -Mode TimeStretch
-# Fit onto a 74-minute CD using time-stretch
+.\Resize-AlbumToFitMD.ps1 -InputFolder ".\MyAlbum" -LP4 -Mode Speed -OutputFormat ALAC
+# Fit onto a MiniDisc in LP4 mode (320 minutes) with ALAC output
+
+.EXAMPLE
+.\Resize-AlbumToFitMD.ps1 -InputFolder ".\MyAlbum" -TargetMinutes 74 -Mode TimeStretch
+# Fit onto a 74-minute MiniDisc in SP mode using time-stretch
 #>
 
 param(
@@ -61,7 +76,11 @@ param(
 
     [string]$OutputFolder = ".\Output",
 
-    [double]$TargetMinutes = 80,
+    [double]$TargetMinutes = 74,
+
+    [switch]$LP2,
+
+    [switch]$LP4,
 
     [Parameter(Mandatory)]
     [ValidateSet('Speed', 'TimeStretch')]
@@ -72,6 +91,24 @@ param(
 
     [string]$FilePattern = ""
 )
+
+# --- Validate LP mode switches ---
+
+if ($LP2 -and $LP4) {
+    throw "Cannot specify both -LP2 and -LP4. Choose one MDLP mode."
+}
+
+# --- Apply LP multiplier to target minutes ---
+
+$lpMode = "SP"
+if ($LP2) {
+    $TargetMinutes *= 2
+    $lpMode = "LP2"
+}
+elseif ($LP4) {
+    $TargetMinutes *= 4
+    $lpMode = "LP4"
+}
 
 # --- Helper Functions ---
 
@@ -169,14 +206,15 @@ $targetSeconds = $TargetMinutes * 60
 $targetDuration = [TimeSpan]::FromSeconds($targetSeconds)
 
 Write-Host ""
+Write-Host "MiniDisc mode:        $lpMode"
 Write-Host "Total album duration: $(Format-DurationShort $totalDuration) ($([math]::Round($totalDuration.TotalMinutes, 2)) minutes)"
-Write-Host "Target duration:      $(Format-DurationShort $targetDuration) ($TargetMinutes minutes)"
+Write-Host "Target duration:      $(Format-DurationShort $targetDuration) ($TargetMinutes minutes, $lpMode)"
 
 # --- Check if Shrinking is Needed ---
 
 if ($totalSeconds -le $targetSeconds) {
     Write-Host ""
-    Write-Host "Album already fits within $TargetMinutes minutes. No shrinking needed!" -ForegroundColor Green
+    Write-Host "Album already fits within $TargetMinutes minutes ($lpMode). No resizing needed!" -ForegroundColor Green
     exit 0
 }
 
@@ -203,7 +241,7 @@ Write-Host "Processing mode: $modeDescription"
 Write-Host "Output format:   $OutputFormat"
 Write-Host ""
 
-$confirm = Read-Host "Proceed with shrinking? [Y/N] (default: Y)"
+$confirm = Read-Host "Proceed with resizing? [Y/N] (default: Y)"
 if ($confirm -match '^[Nn]') {
     Write-Host "Aborted."
     exit 0
@@ -308,10 +346,6 @@ foreach ($track in $trackInfo) {
         }
     }
 
-    # Copy all metadata from source (global and per-stream)
-    $args += @("-map_metadata", "0")           # Copy global metadata
-    $args += @("-map_metadata:s", "0")         # Copy stream metadata
-    
     # Map and copy any attached artwork (video streams)
     $args += @("-map", "0:v?")                 # Optionally map video streams (album art)
     $args += @("-c:v", "copy")                 # Copy video streams without re-encoding
@@ -359,7 +393,7 @@ if ($processedTracks.Count -gt 0) {
     $tolerance = 0.1
     if ($actualTotalSeconds -le ($targetSeconds + $tolerance)) {
         Write-Host ""
-        Write-Host "Success! Album now fits on an $TargetMinutes-minute CD." -ForegroundColor Green
+        Write-Host "Success! Album now fits on a $TargetMinutes-minute MiniDisc ($lpMode)." -ForegroundColor Green
     }
     else {
         $overBy = [TimeSpan]::FromSeconds($actualTotalSeconds - $targetSeconds)

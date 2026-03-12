@@ -70,6 +70,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -79,12 +80,25 @@ try:
         OUTPUT_FORMATS as RESIZE_OUTPUT_FORMATS,
         calculate_speed_factor,
         check_tool as _check_ffmpeg,
+        compute_playlist_resize_factor,
         format_duration_short as _fmt_short,
         resize_tracks,
     )
     _RESIZE_AVAILABLE = _check_ffmpeg("ffmpeg") and _check_ffmpeg("ffprobe")
 except ImportError:
     _RESIZE_AVAILABLE = False
+
+    def compute_playlist_resize_factor(  # type: ignore[misc]
+        total_resize_seconds: float,
+        total_fixed_seconds: float,
+        target_capacity_seconds: float,
+    ) -> "Optional[float]":
+        available = target_capacity_seconds - total_fixed_seconds
+        if available <= 0:
+            return None
+        if total_resize_seconds <= 0:
+            return None
+        return total_resize_seconds / available
 
 # ------------------------------------------------------------------ #
 #  Constants                                                           #
@@ -680,6 +694,367 @@ class ResizeToFitDialog(QDialog):
 
 
 # ------------------------------------------------------------------ #
+#  ResizePlaylistDialog — cross-disc resize to reduce disc count       #
+# ------------------------------------------------------------------ #
+
+
+class ResizePlaylistDialog(QDialog):
+    """Dialog to resize tracks across discs so the playlist fits on fewer discs.
+
+    Three resize scopes are supported:
+
+    * **All discs** — resize every track uniformly (lowest per-track impact).
+    * **Selected discs** — user ticks which discs' tracks to speed up.
+    * **Selected tracks** — only the tracks currently selected in the disc widgets.
+
+    The required speed factor is calculated live and displayed so the user can
+    choose the scope that suits their sound-quality preferences.
+    """
+
+    # Scope IDs used by the QButtonGroup
+    _SCOPE_ALL = 0
+    _SCOPE_DISCS = 1
+    _SCOPE_TRACKS = 2
+
+    def __init__(
+        self,
+        disc_widgets: "List[DiscWidget]",
+        selected_track_ids: "set[int]",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._disc_widgets = disc_widgets
+        self._selected_track_ids = selected_track_ids
+        self._output_folder: Optional[str] = None
+        self.setWindowTitle("Resize Playlist to Fit Fewer Discs")
+        self.setMinimumWidth(520)
+        self._build_ui()
+        self._update_factor_preview()
+
+    # ---- UI construction ----
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        n = len(self._disc_widgets)
+        total_audio = sum(
+            sum(t.duration_seconds for t in dw.disc.tracks)
+            for dw in self._disc_widgets
+        )
+        total_tracks = sum(len(dw.disc.tracks) for dw in self._disc_widgets)
+
+        # --- Summary ---
+        info = QLabel(
+            f"Current split: <b>{n} disc(s)</b>, "
+            f"{total_tracks} track(s), "
+            f"{format_duration(total_audio)} total audio.<br>"
+            "Speed up a subset of tracks so the entire playlist fits on fewer discs."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # --- Target disc count ---
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Target disc count:"))
+        self._target_spin = QSpinBox()
+        self._target_spin.setRange(1, max(1, n - 1))
+        self._target_spin.setValue(max(1, n - 1))
+        self._target_spin.setToolTip(
+            "How many discs the playlist should fit on after resizing."
+        )
+        self._target_spin.valueChanged.connect(self._update_factor_preview)
+        target_row.addWidget(self._target_spin)
+        target_row.addStretch()
+        layout.addLayout(target_row)
+
+        # --- Scope group ---
+        scope_box = QGroupBox("Tracks to resize")
+        scope_layout = QVBoxLayout(scope_box)
+
+        self._scope_btn_group = QButtonGroup(self)
+
+        self._all_radio = QRadioButton(
+            "All tracks on all discs  (uniform proportional speed-up — lowest per-track impact)"
+        )
+        self._all_radio.setChecked(True)
+        self._scope_btn_group.addButton(self._all_radio, self._SCOPE_ALL)
+        scope_layout.addWidget(self._all_radio)
+
+        self._discs_radio = QRadioButton("All tracks on selected discs:")
+        self._scope_btn_group.addButton(self._discs_radio, self._SCOPE_DISCS)
+        scope_layout.addWidget(self._discs_radio)
+
+        # Per-disc checkboxes, indented under the "selected discs" radio
+        self._disc_checks: List[QCheckBox] = []
+        self._disc_checks_widget = QWidget()
+        disc_checks_layout = QVBoxLayout(self._disc_checks_widget)
+        disc_checks_layout.setContentsMargins(28, 2, 0, 2)
+        disc_checks_layout.setSpacing(2)
+        for dw in self._disc_widgets:
+            label = (
+                f"Disc {dw.disc_index + 1} — {dw.disc.config.label()} — "
+                f"{format_duration(dw.disc.total_seconds)} "
+                f"({len(dw.disc.tracks)} track(s))"
+            )
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._update_factor_preview)
+            self._disc_checks.append(cb)
+            disc_checks_layout.addWidget(cb)
+        self._disc_checks_widget.setEnabled(False)
+        scope_layout.addWidget(self._disc_checks_widget)
+
+        n_sel = len(self._selected_track_ids)
+        self._tracks_radio = QRadioButton(
+            f"Selected tracks only  ({n_sel} track(s) currently selected in the disc list)"
+        )
+        self._tracks_radio.setEnabled(n_sel > 0)
+        self._scope_btn_group.addButton(self._tracks_radio, self._SCOPE_TRACKS)
+        scope_layout.addWidget(self._tracks_radio)
+
+        self._all_radio.toggled.connect(self._on_scope_change)
+        self._discs_radio.toggled.connect(self._on_scope_change)
+        self._tracks_radio.toggled.connect(self._on_scope_change)
+
+        layout.addWidget(scope_box)
+
+        # --- Live factor preview ---
+        self._factor_label = QLabel()
+        self._factor_label.setWordWrap(True)
+        self._factor_label.setStyleSheet("padding: 4px;")
+        layout.addWidget(self._factor_label)
+
+        # --- Options ---
+        options_box = QGroupBox("Options")
+        options_layout = QVBoxLayout(options_box)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("Speed  (pitch rises with tempo)", "Speed")
+        self._mode_combo.addItem(
+            "TimeStretch  (pitch preserved, needs librubberband)", "TimeStretch"
+        )
+        mode_row.addWidget(self._mode_combo, stretch=1)
+        options_layout.addLayout(mode_row)
+
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("Output format:"))
+        self._fmt_combo = QComboBox()
+        if _RESIZE_AVAILABLE:
+            for fmt in RESIZE_OUTPUT_FORMATS:
+                self._fmt_combo.addItem(fmt, fmt)
+        else:
+            for fmt in ("FLAC", "WAV", "AIFF", "ALAC", "APE", "WavPack", "TTA"):
+                self._fmt_combo.addItem(fmt, fmt)
+        fmt_row.addWidget(self._fmt_combo, stretch=1)
+        options_layout.addLayout(fmt_row)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Output folder:"))
+        self._folder_edit = QLineEdit()
+        self._folder_edit.setPlaceholderText("(required)")
+        self._folder_edit.setReadOnly(True)
+        folder_row.addWidget(self._folder_edit, stretch=1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._browse_folder)
+        folder_row.addWidget(browse_btn)
+        options_layout.addLayout(folder_row)
+
+        self._reload_check = QCheckBox("Reload resized tracks into their discs when done")
+        self._reload_check.setChecked(True)
+        options_layout.addWidget(self._reload_check)
+
+        layout.addWidget(options_box)
+
+        # --- Warning if ffmpeg unavailable ---
+        if not _RESIZE_AVAILABLE:
+            warn = QLabel(
+                "⚠  <b>ffmpeg / ffprobe not found in PATH.</b>  "
+                "Install ffmpeg to enable resizing."
+            )
+            warn.setWordWrap(True)
+            warn.setStyleSheet(
+                "color: #f38ba8; background: #313244; padding: 6px; border-radius: 4px;"
+            )
+            layout.addWidget(warn)
+
+        # --- Buttons ---
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if self._ok_btn:
+            self._ok_btn.setText("Resize")
+            self._ok_btn.setEnabled(_RESIZE_AVAILABLE)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    # ---- Internal helpers ----
+
+    def _on_scope_change(self) -> None:
+        self._disc_checks_widget.setEnabled(self._discs_radio.isChecked())
+        self._update_factor_preview()
+
+    def _get_target_capacity(self) -> float:
+        """Total capacity of the first *target* discs in the current split."""
+        t = self._target_spin.value()
+        caps = [dw.disc.config.capacity_seconds for dw in self._disc_widgets]
+        total = 0.0
+        for i in range(t):
+            # For target counts beyond the current disc list, reuse the last config
+            total += caps[i] if i < len(caps) else (caps[-1] if caps else 74 * 60)
+        return total
+
+    def _get_resize_and_fixed_seconds(self) -> tuple[float, float]:
+        """Return (resize_seconds, fixed_seconds) for the current scope."""
+        scope = self._scope_btn_group.checkedId()
+        all_tracks = [t for dw in self._disc_widgets for t in dw.disc.tracks]
+
+        if scope == self._SCOPE_ALL:
+            return sum(t.duration_seconds for t in all_tracks), 0.0
+
+        if scope == self._SCOPE_DISCS:
+            checked = {i for i, cb in enumerate(self._disc_checks) if cb.isChecked()}
+            resize_s = sum(
+                t.duration_seconds
+                for i, dw in enumerate(self._disc_widgets)
+                if i in checked
+                for t in dw.disc.tracks
+            )
+            fixed_s = sum(
+                t.duration_seconds
+                for i, dw in enumerate(self._disc_widgets)
+                if i not in checked
+                for t in dw.disc.tracks
+            )
+            return resize_s, fixed_s
+
+        # SCOPE_TRACKS
+        resize_s = sum(
+            t.duration_seconds
+            for dw in self._disc_widgets
+            for t in dw.disc.tracks
+            if id(t) in self._selected_track_ids
+        )
+        fixed_s = sum(
+            t.duration_seconds
+            for dw in self._disc_widgets
+            for t in dw.disc.tracks
+            if id(t) not in self._selected_track_ids
+        )
+        return resize_s, fixed_s
+
+    def _compute_speed_factor(self) -> Optional[float]:
+        resize_s, fixed_s = self._get_resize_and_fixed_seconds()
+        return compute_playlist_resize_factor(resize_s, fixed_s, self._get_target_capacity())
+
+    def _update_factor_preview(self) -> None:
+        factor = self._compute_speed_factor()
+        target_cap = self._get_target_capacity()
+        t = self._target_spin.value()
+        n = len(self._disc_widgets)
+
+        if factor is None:
+            self._factor_label.setText(
+                "<span style='color:#f38ba8;'>"
+                "⚠ Cannot fit: the unresized tracks already exceed the target capacity. "
+                "Select more tracks/discs, or increase the target disc count."
+                "</span>"
+            )
+            if self._ok_btn:
+                self._ok_btn.setEnabled(False)
+            return
+
+        if factor <= 1.0:
+            self._factor_label.setText(
+                f"<span style='color:#a6e3a1;'>"
+                f"✓ Already fits on {t} disc(s) — no resizing needed."
+                f"</span>"
+            )
+            if self._ok_btn:
+                self._ok_btn.setEnabled(False)
+            return
+
+        pct = (factor - 1) * 100
+        self._factor_label.setText(
+            f"<span style='color:#f9e2af;'>"
+            f"Speed factor: <b>{factor:.4f}×</b> ({pct:.2f}% faster) — "
+            f"target capacity: {format_duration(target_cap)} "
+            f"({t} of {n} disc(s))"
+            f"</span>"
+        )
+        if self._ok_btn:
+            self._ok_btn.setEnabled(_RESIZE_AVAILABLE)
+
+    def _browse_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select output folder for resized tracks"
+        )
+        if folder:
+            self._output_folder = folder
+            self._folder_edit.setText(folder)
+
+    def _on_accept(self) -> None:
+        if not self._output_folder:
+            QMessageBox.warning(
+                self,
+                "No output folder",
+                "Please select an output folder before resizing.",
+            )
+            return
+        factor = self._compute_speed_factor()
+        if factor is None or factor <= 1.0:
+            QMessageBox.information(
+                self,
+                "No resizing needed",
+                "The selected tracks already fit within the target capacity.",
+            )
+            return
+        self.accept()
+
+    # ---- Public accessors (read by PlaylistSplitterApp after accept) ----
+
+    def get_tracks_to_resize(self) -> "List[Track]":
+        """Return the Track objects that should be sent to ffmpeg."""
+        scope = self._scope_btn_group.checkedId()
+        if scope == self._SCOPE_ALL:
+            return [t for dw in self._disc_widgets for t in dw.disc.tracks]
+        if scope == self._SCOPE_DISCS:
+            checked = {i for i, cb in enumerate(self._disc_checks) if cb.isChecked()}
+            return [
+                t
+                for i, dw in enumerate(self._disc_widgets)
+                if i in checked
+                for t in dw.disc.tracks
+            ]
+        # SCOPE_TRACKS
+        return [
+            t
+            for dw in self._disc_widgets
+            for t in dw.disc.tracks
+            if id(t) in self._selected_track_ids
+        ]
+
+    def get_speed_factor(self) -> float:
+        return self._compute_speed_factor() or 1.0
+
+    def selected_mode(self) -> str:
+        return self._mode_combo.currentData() or "Speed"
+
+    def selected_format(self) -> str:
+        return self._fmt_combo.currentData() or "FLAC"
+
+    def output_folder(self) -> str:
+        return self._output_folder or ""
+
+    def reload_after(self) -> bool:
+        return self._reload_check.isChecked()
+
+
+# ------------------------------------------------------------------ #
 #  CapacityBar — custom-painted track segments                         #
 # ------------------------------------------------------------------ #
 
@@ -1163,6 +1538,22 @@ class PlaylistSplitterApp(QMainWindow):
         self._export_btn.clicked.connect(self._export_listing)
         toolbar.addWidget(self._export_btn)
 
+        # "Resize Playlist" button — hidden until ≥2 discs are loaded
+        self._resize_playlist_btn = QPushButton("\u26A1  Resize Playlist")
+        self._resize_playlist_btn.setToolTip(
+            "Speed up tracks across discs so the entire playlist fits on fewer discs "
+            "(requires ffmpeg). Choose which discs or tracks to resize."
+        )
+        self._resize_playlist_btn.setStyleSheet(
+            "QPushButton { background-color: #45475a; color: #f9e2af; "
+            "border: 1px solid #f9e2af; border-radius: 6px; padding: 6px 14px; "
+            "font-weight: bold; }"
+            "QPushButton:hover { background-color: #585b70; }"
+        )
+        self._resize_playlist_btn.clicked.connect(self._on_resize_playlist_clicked)
+        self._resize_playlist_btn.setVisible(False)
+        toolbar.addWidget(self._resize_playlist_btn)
+
         root.addLayout(toolbar)
 
         # --- Suggestion banner ---
@@ -1322,6 +1713,7 @@ class PlaylistSplitterApp(QMainWindow):
     def _update_summary(self) -> None:
         if not self._disc_widgets:
             self._summary_label.setText("")
+            self._resize_playlist_btn.setVisible(False)
             return
 
         discs = [dw.disc for dw in self._disc_widgets]
@@ -1348,6 +1740,11 @@ class PlaylistSplitterApp(QMainWindow):
             f"Shopping list: {shopping_str}"
         )
 
+        # Show the "Resize Playlist" button when there are ≥2 discs and ffmpeg is ready
+        self._resize_playlist_btn.setVisible(
+            _RESIZE_AVAILABLE and len(self._disc_widgets) >= 2
+        )
+
     # ---- Track movement between discs ----
 
     def move_tracks_to_disc(self, track_ids: list[int], target_index: int) -> None:
@@ -1370,6 +1767,164 @@ class PlaylistSplitterApp(QMainWindow):
         for dw in self._disc_widgets:
             dw.refresh()
         self._update_summary()
+
+    # ---- Cross-disc "Resize Playlist" ----
+
+    def _on_resize_playlist_clicked(self) -> None:
+        """Open ResizePlaylistDialog and execute the resize if confirmed."""
+        if len(self._disc_widgets) < 2:
+            return
+
+        # Snapshot which track list items are currently selected across all discs
+        selected_ids: set[int] = set()
+        for dw in self._disc_widgets:
+            for item in dw._track_list.selectedItems():
+                tid = item.data(Qt.ItemDataRole.UserRole)
+                if tid is not None:
+                    selected_ids.add(tid)
+
+        dialog = ResizePlaylistDialog(
+            self._disc_widgets, selected_ids, parent=self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        tracks_to_resize = dialog.get_tracks_to_resize()
+        if not tracks_to_resize:
+            return
+
+        speed_factor = dialog.get_speed_factor()
+        output_folder = dialog.output_folder()
+        mode = dialog.selected_mode()
+        fmt = dialog.selected_format()
+        do_reload = dialog.reload_after()
+
+        input_files = [Path(t.path) for t in tracks_to_resize]
+
+        results_holder: list = [None]
+        done_event = threading.Event()
+
+        def _worker() -> None:
+            try:
+                results_holder[0] = resize_tracks(
+                    input_files,
+                    output_folder,
+                    speed_factor,
+                    mode=mode,
+                    output_format=fmt,
+                    quiet=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Catching Exception (not BaseException) is intentional: KeyboardInterrupt
+                # and SystemExit are BaseException but not Exception, so they won't be
+                # silently swallowed. Any other unexpected error from resize_tracks is
+                # captured here so the background thread can communicate it to the UI.
+                results_holder[0] = exc
+            finally:
+                done_event.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+        progress = QProgressDialog(
+            f"Resizing {len(input_files)} track(s)…",
+            None,
+            0, 0,
+            self,
+        )
+        progress.setWindowTitle("Resizing Playlist Tracks")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+
+        while not done_event.wait(timeout=0.05):
+            QApplication.processEvents()
+
+        progress.close()
+
+        raw = results_holder[0]
+        if isinstance(raw, Exception):
+            QMessageBox.critical(
+                self,
+                "Resize failed",
+                f"An error occurred during resizing:\n{raw}",
+            )
+            return
+
+        results = raw  # list of (output_path, duration_or_None)
+        failed = [p for p, d in results if d is None]
+        if failed:
+            QMessageBox.warning(
+                self,
+                "Some tracks failed",
+                "The following tracks could not be resized:\n"
+                + "\n".join(f"  • {Path(p).name}" for p in failed),
+            )
+
+        if do_reload:
+            self._reload_resized_playlist(tracks_to_resize, results)
+
+    def _reload_resized_playlist(
+        self,
+        original_tracks: "List[Track]",
+        resize_results: "List[tuple[str, Optional[float]]]",
+    ) -> None:
+        """Replace resized tracks in-place across all disc widgets.
+
+        Builds a mapping ``original_path → new_path`` from the resize results
+        and re-scans the new files to get accurate durations, then substitutes
+        each old track with its resized counterpart in whichever disc it lives.
+
+        Parameters
+        ----------
+        original_tracks: The Track objects that were passed to ffmpeg.
+        resize_results:  Pairs of ``(output_path, duration)`` in the same order
+                         as *original_tracks*.  ``duration`` is ``None`` on failure.
+        """
+        # Build old path → new path for successful encodes
+        path_map: dict[str, str] = {}
+        new_paths: List[str] = []
+        for orig, (new_path, dur) in zip(original_tracks, resize_results):
+            if dur is not None:
+                path_map[orig.path] = new_path
+                new_paths.append(new_path)
+
+        if not new_paths:
+            return
+
+        # Scan the new files to get Track objects with correct metadata/duration
+        new_track_objs, errors = scan_audio_files(new_paths)
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Some resized tracks could not be loaded",
+                "\n".join(errors[:15])
+                + ("\n\u2026and more." if len(errors) > 15 else ""),
+            )
+
+        # Index new tracks by their file path
+        new_by_path: dict[str, Track] = {t.path: t for t in new_track_objs}
+
+        self._save_undo()
+        for dw in self._disc_widgets:
+            new_list: List[Track] = []
+            for t in dw.disc.tracks:
+                if t.path in path_map:
+                    resized = new_by_path.get(path_map[t.path])
+                    new_list.append(resized if resized is not None else t)
+                else:
+                    new_list.append(t)
+            dw.disc.tracks = new_list
+            dw.refresh()
+
+        # Keep the global track list consistent
+        self._tracks = [t for dw in self._disc_widgets for t in dw.disc.tracks]
+        self._update_summary()
+
+        n_ok = len(new_paths)
+        QMessageBox.information(
+            self,
+            "Reload complete",
+            f"{n_ok} track(s) have been replaced with their resized versions.",
+        )
 
     def reload_resized_disc(self, disc_index: int, new_paths: List[str]) -> None:
         """Replace the tracks on *disc_index* with the resized files at *new_paths*.

@@ -169,6 +169,41 @@ def calculate_speed_factor(
     return total_seconds / target_seconds
 
 
+def compute_playlist_resize_factor(
+    total_resize_seconds: float,
+    total_fixed_seconds: float,
+    target_capacity_seconds: float,
+) -> Optional[float]:
+    """Return the speed factor needed to resize a subset of a playlist.
+
+    Computes the factor by which *total_resize_seconds* of audio must be sped up
+    so the entire playlist (resized + fixed) fits within *target_capacity_seconds*.
+
+    Parameters
+    ----------
+    total_resize_seconds:    Combined duration of the tracks that will be resized.
+    total_fixed_seconds:     Combined duration of the tracks that will *not* be resized.
+    target_capacity_seconds: Total available capacity across the target discs.
+
+    Returns ``None`` if the fixed tracks alone already fill or exceed the target
+    (i.e. it is impossible to fit by speeding up only the resize tracks).
+    Returns a value ≤ 1.0 if no resizing is actually needed.
+
+    >>> abs(compute_playlist_resize_factor(90, 0, 60) - 1.5) < 1e-9
+    True
+    >>> compute_playlist_resize_factor(30, 90, 60) is None
+    True
+    >>> compute_playlist_resize_factor(20, 30, 60) <= 1.0
+    True
+    """
+    available = target_capacity_seconds - total_fixed_seconds
+    if available <= 0:
+        return None  # fixed tracks already fill or exceed the target
+    if total_resize_seconds <= 0:
+        return None
+    return total_resize_seconds / available
+
+
 def find_audio_files(
     folder: str | Path,
     file_pattern: Optional[str] = None,

@@ -18,6 +18,7 @@ import pytest
 from resize_album_to_fit_md import (
     build_atempo_chain,
     calculate_speed_factor,
+    compute_playlist_resize_factor,
     find_audio_files,
     format_duration_long,
     format_duration_short,
@@ -314,3 +315,51 @@ class TestResizeAlbum:
         output = tmp_path / "out"
         resize_album(folder, output, target_minutes=0.5, lp_mode="SP", mode="Speed", output_format="AIFF", yes=True, quiet=True)
         assert len(list(output.glob("*.aiff"))) == 2
+
+
+# ------------------------------------------------------------------ #
+#  Unit tests for compute_playlist_resize_factor                       #
+# ------------------------------------------------------------------ #
+
+
+class TestComputePlaylistResizeFactor:
+
+    def test_all_tracks_basic(self):
+        # 90s total, no fixed tracks, target 60s → factor 1.5
+        factor = compute_playlist_resize_factor(90, 0, 60)
+        assert factor is not None
+        assert abs(factor - 1.5) < 1e-9
+
+    def test_partial_tracks(self):
+        # resize 60s, fixed 20s, target 80s → available = 80-20 = 60s, factor = 60/60 = 1.0 (exactly fits)
+        factor = compute_playlist_resize_factor(60, 20, 80)
+        assert factor is not None
+        assert abs(factor - 1.0) < 1e-9
+
+    def test_partial_tracks_over(self):
+        # resize 60s, fixed 20s, target 70s → available = 50s, factor = 60/50 = 1.2
+        factor = compute_playlist_resize_factor(60, 20, 70)
+        assert factor is not None
+        assert abs(factor - 1.2) < 1e-9
+
+    def test_fixed_tracks_exceed_target_returns_none(self):
+        # fixed=70, target=60 → available ≤ 0 → impossible
+        assert compute_playlist_resize_factor(30, 70, 60) is None
+
+    def test_fixed_tracks_equal_target_returns_none(self):
+        assert compute_playlist_resize_factor(10, 60, 60) is None
+
+    def test_already_fits_returns_le_1(self):
+        # 20s resize + 30s fixed = 50s total, target 60s → factor < 1 (no resize needed)
+        factor = compute_playlist_resize_factor(20, 30, 60)
+        assert factor is not None
+        assert factor <= 1.0
+
+    def test_zero_resize_seconds_returns_none(self):
+        assert compute_playlist_resize_factor(0, 30, 60) is None
+
+    def test_zero_target_fixed_all_resize(self):
+        # 120s total, no fixed, target 60s → factor = 2.0
+        factor = compute_playlist_resize_factor(120, 0, 60)
+        assert factor is not None
+        assert abs(factor - 2.0) < 1e-9

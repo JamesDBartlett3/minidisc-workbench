@@ -908,24 +908,37 @@ class ResizePlaylistDialog(QDialog):
             total += caps[i] if i < len(caps) else (caps[-1] if caps else 74 * 60)
         return total
 
+    @staticmethod
+    def _track_effective(disc: Disc, track: Track) -> float:
+        """Effective seconds a track occupies on *disc* (audio + cluster waste + metadata)."""
+        return track.duration_seconds + disc.cluster_waste_for(track) + disc.track_overhead_seconds
+
     def _get_resize_and_fixed_seconds(self) -> tuple[float, float]:
-        """Return (resize_seconds, fixed_seconds) for the current scope."""
+        """Return (resize_seconds, fixed_seconds) for the current scope.
+
+        Values include cluster-alignment waste and per-track metadata
+        overhead so that the fit-check matches the main splitter logic.
+        """
         scope = self._scope_btn_group.checkedId()
-        all_tracks = [t for dw in self._disc_widgets for t in dw.disc.tracks]
 
         if scope == self._SCOPE_ALL:
-            return sum(t.duration_seconds for t in all_tracks), 0.0
+            total = sum(
+                self._track_effective(dw.disc, t)
+                for dw in self._disc_widgets
+                for t in dw.disc.tracks
+            )
+            return total, 0.0
 
         if scope == self._SCOPE_DISCS:
             checked = {i for i, cb in enumerate(self._disc_checks) if cb.isChecked()}
             resize_s = sum(
-                t.duration_seconds
+                self._track_effective(dw.disc, t)
                 for i, dw in enumerate(self._disc_widgets)
                 if i in checked
                 for t in dw.disc.tracks
             )
             fixed_s = sum(
-                t.duration_seconds
+                self._track_effective(dw.disc, t)
                 for i, dw in enumerate(self._disc_widgets)
                 if i not in checked
                 for t in dw.disc.tracks
@@ -934,13 +947,13 @@ class ResizePlaylistDialog(QDialog):
 
         # SCOPE_TRACKS
         resize_s = sum(
-            t.duration_seconds
+            self._track_effective(dw.disc, t)
             for dw in self._disc_widgets
             for t in dw.disc.tracks
             if id(t) in self._selected_track_ids
         )
         fixed_s = sum(
-            t.duration_seconds
+            self._track_effective(dw.disc, t)
             for dw in self._disc_widgets
             for t in dw.disc.tracks
             if id(t) not in self._selected_track_ids

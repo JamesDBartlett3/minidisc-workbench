@@ -242,10 +242,12 @@ def resize_tracks(
     quiet:          Suppress per-track progress messages.
 
     Returns a list of ``(output_path, actual_duration_seconds)`` tuples.
-    ``actual_duration_seconds`` is ``None`` if the file could not be read back.
+    ``actual_duration_seconds`` is ``None`` if the file could not be processed;
+    in that case the output path string contains the error reason.
     """
     output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
+    pad = len(str(len(input_files)))
 
     fmt_upper = output_format.upper()
     if fmt_upper not in OUTPUT_FORMATS:
@@ -271,7 +273,7 @@ def resize_tracks(
     for idx, src in enumerate(input_files, start=1):
         src = Path(src)
         stem = src.stem
-        out_path = output_folder / f"{stem}.{out_ext}"
+        out_path = output_folder / f"{idx:0{pad}d} - {stem}.{out_ext}"
 
         if not quiet:
             try:
@@ -299,18 +301,20 @@ def resize_tracks(
         proc = subprocess.run(ffmpeg_args, capture_output=True, text=True)
 
         if proc.returncode != 0:
+            reason = (proc.stderr or "").strip()
+            if mode_lower == "timestretch" and not reason:
+                reason = (
+                    "TimeStretch mode requires ffmpeg built with "
+                    "librubberband support. Try Speed mode instead."
+                )
+            if not reason:
+                reason = f"ffmpeg exited with code {proc.returncode}"
             if not quiet:
                 print(
-                    f"  Warning: ffmpeg reported an issue processing '{src.name}'.",
+                    f"  Warning: ffmpeg reported an issue processing '{src.name}': {reason}",
                     file=sys.stderr,
                 )
-                if mode_lower == "timestretch":
-                    print(
-                        "  Note: TimeStretch mode requires ffmpeg built with librubberband support.\n"
-                        "  If not available, try --mode Speed instead.",
-                        file=sys.stderr,
-                    )
-            results.append((str(out_path), None))
+            results.append((f"{src.name}: {reason}", None))
             continue
 
         # Verify the output and read back its actual duration
@@ -321,7 +325,7 @@ def resize_tracks(
                 actual_dur = None
             results.append((str(out_path), actual_dur))
         else:
-            results.append((str(out_path), None))
+            results.append((f"{src.name}: output file not found after encoding", None))
 
     return results
 

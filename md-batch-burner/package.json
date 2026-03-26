@@ -1,0 +1,15 @@
+{
+  "name": "netmd-batch-helper",
+  "version": "1.0.0",
+  "description": "CLI helper for MiniDisc batch burner using netmd-js",
+  "main": "netmd-batch-helper.js",
+  "scripts": {
+    "start": "node netmd-batch-helper.js"
+  },
+  "dependencies": {
+    "netmd-js": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

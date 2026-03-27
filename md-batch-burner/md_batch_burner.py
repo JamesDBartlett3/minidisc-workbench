@@ -27,6 +27,15 @@ from PySide6.QtGui import (
 from PySide6.QtMultimedia import QSoundEffect
 from mutagen import File as MutagenFile
 
+# Import audio conversion functions
+try:
+    from audio_converter import convert_for_sp, convert_for_lp2, convert_for_lp4
+except ImportError:
+    # Fallback stubs if audio_converter not available
+    def convert_for_sp(input_path, output_path): return None
+    def convert_for_lp2(input_path, output_path): return None
+    def convert_for_lp4(input_path, output_path): return None
+
 
 # =============================================================================
 # Data Models
@@ -313,7 +322,23 @@ class BurnWorker(QThread):
 
                     # Convert audio (placeholder - would call audio_converter)
                     self.status_updated.emit(f"Converting '{track.name}' to {disc.config.mode} format...")
-                    self.msleep(500)  # Simulate conversion
+                    try:
+                        stem = Path(track.path).stem
+                        if disc.config.mode == "SP":
+                            converted_path = os.path.join(temp_dir, stem + '.raw')
+                            success = convert_for_sp(track.path, converted_path)
+                        elif disc.config.mode == "LP2":
+                            converted_path = os.path.join(temp_dir, stem + '.oma')
+                            success = convert_for_lp2(track.path, converted_path)
+                        else:  # LP4
+                            converted_path = os.path.join(temp_dir, stem + '.oma')
+                            success = convert_for_lp4(track.path, converted_path)
+                        
+                        upload_path = converted_path if success else track.path
+                    except Exception as e:
+                        self.error_occurred.emit(f"Failed to convert '{track.name}': {str(e)}")
+                        disc.status = DiscStatus.ERROR
+                        return
 
                     # Upload to device
                     self.status_updated.emit(f"Uploading '{track.name}' to MiniDisc...")

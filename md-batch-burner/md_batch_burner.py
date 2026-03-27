@@ -8,6 +8,10 @@ import os
 import sys
 import json
 import subprocess
+import threading
+import tempfile
+import shutil
+import html
 from dataclasses import dataclass, field
 from typing import List, Optional
 from enum import Enum
@@ -26,6 +30,15 @@ from PySide6.QtGui import (
 )
 from PySide6.QtMultimedia import QSoundEffect
 from mutagen import File as MutagenFile
+
+# Import audio conversion functions
+try:
+    from audio_converter import convert_for_sp, convert_for_lp2, convert_for_lp4
+except ImportError:
+    # Fallback stubs if audio_converter not available
+    def convert_for_sp(input_path, output_path): return None
+    def convert_for_lp2(input_path, output_path): return None
+    def convert_for_lp4(input_path, output_path): return None
 
 
 # =============================================================================
@@ -62,8 +75,8 @@ class DiscConfig:
     @property
     def capacity_seconds(self) -> int:
         """Return disc capacity in seconds based on mode."""
-        mode_factors = {"SP": 1.0, "LP2": 2.0, "LP4": 4.0}
-        return self.disc_size * 60 * mode_factors.get(self.mode, 1.0)
+        mode_factors = {"SP": 1, "LP2": 2, "LP4": 4}
+        return self.disc_size * 60 * mode_factors.get(self.mode, 1)
 
 
 @dataclass
@@ -176,7 +189,7 @@ class Notifier:
         """Show desktop toast notification."""
         try:
             if sys.platform == "linux":
-                # Try notify-send (libnotify)
+                # Try notify-send (libnotify) - already safe with separate args
                 subprocess.run(
                     ["notify-send", "-u", "normal", "-t", "5000",
                      "-i", "media-optical", title, message],
@@ -184,13 +197,19 @@ class Notifier:
                 )
             elif sys.platform == "darwin":
                 # macOS - use osascript for notification
-                script = f'display notification "{message}" with title "{title}"'
+                # Escape backslashes and double quotes for AppleScript
+                safe_title = title.replace('\\', '\\\\').replace('"', '\\"')
+                safe_message = message.replace('\\', '\\\\').replace('"', '\\"')
+                script = f'display notification "{safe_message}" with title "{safe_title}"'
                 subprocess.run(
                     ["osascript", "-e", script],
                     capture_output=True, timeout=5
                 )
             elif sys.platform == "win32":
                 # Windows 10+ - use PowerShell toast
+                # Use html.escape for XML entities
+                safe_title = html.escape(title)
+                safe_message = html.escape(message)
                 ps_script = f'''
                 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
                 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
@@ -198,8 +217,8 @@ class Notifier:
                 <toast>
                     <visual>
                         <binding template="ToastText02">
-                            <text id="1">{title}</text>
-                            <text id="2">{message}</text>
+                            <text id="1">{safe_title}</text>
+                            <text id="2">{safe_message}</text>
                         </binding>
                     </visual>
                 </toast>
@@ -222,16 +241,17 @@ class Notifier:
 # Node.js Helper Communication
 # =============================================================================
 
-def call_helper(command_dict: dict) -> dict:
-    """Call the Node.js helper via subprocess."""
-    script_dir = Path(__file__).parent
-    helper_path = script_dir / "netmd-batch-helper.js"
-
-    if not helper_path.exists():
-        raise FileNotFoundError(f"Helper script not found: {helper_path}")
-
-    try:
-        proc = subprocess.Popen(
+class HelperProcess:
+    """Manages a persistent Node.js helper process for NetMD communication."""
+    
+    def __init__(self):
+        self._proc = None
+        self._lock = threading.Lock()
+    
+    def start(self):
+        script_dir = Path(__file__).parent
+        helper_path = script_dir / "netmd-batch-helper.js"
+        self._proc = subprocess.Popen(
             ['node', str(helper_path)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -239,16 +259,55 @@ def call_helper(command_dict: dict) -> dict:
             text=True,
             cwd=str(script_dir)
         )
-        stdout, stderr = proc.communicate(json.dumps(command_dict) + '\n')
+    
+    def call(self, command_dict: dict) -> dict:
+        with self._lock:
+            if not self._proc or self._proc.poll() is not None:
+                self.start()
+            self._proc.stdin.write(json.dumps(command_dict) + '\n')
+            self._proc.stdin.flush()
+            line = self._proc.stdout.readline()
+            return json.loads(line)
+    
+    def stop(self):
+        if self._proc:
+            self._proc.terminate()
+            self._proc = None
 
-        if proc.returncode != 0:
-            raise RuntimeError(f"Helper error: {stderr}")
 
-        return json.loads(stdout)
-    except FileNotFoundError:
-        raise RuntimeError("Node.js is not installed or not in PATH")
-    except json.JSONDecodeError:
-        raise RuntimeError(f"Invalid JSON response from helper: {stdout}")
+# Module-level helper instance
+helper = HelperProcess()
+
+
+
+# =============================================================================
+# Device Checker Thread
+# =============================================================================
+
+class DeviceChecker(QThread):
+    """Background thread for polling device status."""
+    
+    device_status = Signal(bool, str)  # connected, device_name
+    
+    def __init__(self):
+        super().__init__()
+        self._running = False
+    
+    def run(self):
+        self._running = True
+        while self._running:
+            try:
+                result = helper.call({"action": "get_device"})
+                connected = result.get("connected", False)
+                device_name = result.get("name", "Unknown Device") if connected else ""
+                self.device_status.emit(connected, device_name)
+            except Exception:
+                self.device_status.emit(False, "")
+            self.msleep(5000)  # Poll every 5 seconds
+    
+    def stop(self):
+        self._running = False
+        self.wait()
 
 
 # =============================================================================
@@ -277,13 +336,17 @@ class BurnWorker(QThread):
     def run(self):
         """Main burning loop."""
         self._running = True
+        temp_dir = None
 
         try:
             # Check device connection
-            device_info = call_helper({"action": "get_device"})
+            device_info = helper.call({"action": "get_device"})
             if not device_info.get("connected", False):
                 self.error_occurred.emit("No MiniDisc device connected")
                 return
+
+            # Create temp directory for converted files
+            temp_dir = tempfile.mkdtemp(prefix="minidisc_burn_")
 
             for disc_idx, disc in enumerate(self.discs):
                 if not self._running:
@@ -311,16 +374,32 @@ class BurnWorker(QThread):
                         f"Processing '{track.name}' ({track_idx + 1}/{len(disc.tracks)})..."
                     )
 
-                    # Convert audio (placeholder - would call audio_converter)
+                    # Convert audio using audio_converter
                     self.status_updated.emit(f"Converting '{track.name}' to {disc.config.mode} format...")
-                    self.msleep(500)  # Simulate conversion
+                    try:
+                        stem = Path(track.path).stem
+                        if disc.config.mode == "SP":
+                            converted_path = os.path.join(temp_dir, stem + '.raw')
+                            success = convert_for_sp(track.path, converted_path)
+                        elif disc.config.mode == "LP2":
+                            converted_path = os.path.join(temp_dir, stem + '.oma')
+                            success = convert_for_lp2(track.path, converted_path)
+                        else:  # LP4
+                            converted_path = os.path.join(temp_dir, stem + '.oma')
+                            success = convert_for_lp4(track.path, converted_path)
+                        
+                        upload_path = converted_path if success else track.path
+                    except Exception as e:
+                        self.error_occurred.emit(f"Failed to convert '{track.name}': {str(e)}")
+                        disc.status = DiscStatus.ERROR
+                        return
 
                     # Upload to device
                     self.status_updated.emit(f"Uploading '{track.name}' to MiniDisc...")
                     try:
-                        call_helper({
+                        helper.call({
                             "action": "upload_track",
-                            "path": track.path,
+                            "path": upload_path,
                             "mode": disc.config.mode
                         })
                         self.msleep(300)  # Simulate upload time
@@ -329,16 +408,26 @@ class BurnWorker(QThread):
                         disc.status = DiscStatus.ERROR
                         return
 
-                # Disc complete
-                disc.status = DiscStatus.COMPLETE
+                # Disc complete - only set COMPLETE on last disc
+                is_last_disc = disc_idx >= len(self.discs) - 1
+                if is_last_disc:
+                    disc.status = DiscStatus.COMPLETE
+                else:
+                    disc.status = DiscStatus.WAITING_FOR_DISC
+                
                 self.disc_complete.emit(disc_idx)
                 self.progress_updated.emit(disc_idx, len(disc.tracks), len(disc.tracks), 100.0)
 
                 # Check if more discs to process
                 if disc_idx < len(self.discs) - 1:
-                    self.status_updated.emit("Disc complete! Waiting for disc swap...")
                     disc.status = DiscStatus.WAITING_FOR_DISC
-                    break  # Wait for user to continue
+                    self.status_updated.emit("Disc complete! Please swap disc...")
+                    self._paused = True
+                    while self._paused:
+                        if not self._running:
+                            return
+                        self.msleep(200)
+                    self.status_updated.emit(f"Continuing with Disc {disc_idx + 2}...")
 
             if self._running:
                 self.burning_complete.emit()
@@ -347,6 +436,12 @@ class BurnWorker(QThread):
             self.error_occurred.emit(f"Burning failed: {str(e)}")
         finally:
             self._running = False
+            # Clean up temp files
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception:
+                    pass
 
     def pause(self):
         """Pause burning."""
@@ -403,14 +498,17 @@ class DropZone(QFrame):
             self.files_dropped.emit(files)
 
     def mousePressEvent(self, event):
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select Audio Files",
-            "",
-            "Audio Files (*.mp3 *.wav *.flac *.ogg *.m4a *.aac);;All Files (*)"
-        )
-        if files:
-            self.files_dropped.emit(files)
+        if event.button() == Qt.LeftButton:
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                "Select Audio Files",
+                "",
+                "Audio Files (*.mp3 *.wav *.flac *.ogg *.m4a *.aac);;All Files (*)"
+            )
+            if files:
+                self.files_dropped.emit(files)
+        else:
+            super().mousePressEvent(event)
 
 
 class DiscWidget(QGroupBox):
@@ -431,6 +529,8 @@ class DiscWidget(QGroupBox):
         self.status_label.setAlignment(Qt.AlignRight)
         self.status_label.setStyleSheet("font-weight: bold;")
         header_layout.addWidget(self.status_label)
+
+        layout.addLayout(header_layout)
 
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -855,25 +955,18 @@ class MiniDiscBatchBurner(QMainWindow):
         main_layout.addWidget(self.status_label)
 
     def _start_device_polling(self):
-        """Start polling for device status."""
-        self.device_timer = QTimer()
-        self.device_timer.timeout.connect(self._check_device)
-        self.device_timer.start(5000)  # Poll every 5 seconds
-        self._check_device()
+        """Start polling for device status using background thread."""
+        self.device_checker = DeviceChecker()
+        self.device_checker.device_status.connect(self._on_device_status)
+        self.device_checker.start()
 
-    def _check_device(self):
-        """Check device connection status."""
-        try:
-            result = call_helper({"action": "get_device"})
-            if result.get("connected", False):
-                device_name = result.get("name", "Unknown Device")
-                self.device_status_label.setText(f"● Connected - {device_name}")
-                self.device_status_label.setStyleSheet("color: #4eff4e; font-weight: bold;")
-            else:
-                self.device_status_label.setText("● Not Connected")
-                self.device_status_label.setStyleSheet("color: #ff4a4a; font-weight: bold;")
-        except Exception:
-            self.device_status_label.setText("● Helper Error")
+    def _on_device_status(self, connected: bool, device_name: str):
+        """Handle device status update from background thread."""
+        if connected:
+            self.device_status_label.setText(f"● Connected - {device_name}")
+            self.device_status_label.setStyleSheet("color: #4eff4e; font-weight: bold;")
+        else:
+            self.device_status_label.setText("● Not Connected")
             self.device_status_label.setStyleSheet("color: #ff4a4a; font-weight: bold;")
 
     def _handle_dropped_files(self, files: List[str]):
@@ -915,6 +1008,13 @@ class MiniDiscBatchBurner(QMainWindow):
             for disc in self.discs:
                 disc.config = DiscConfig(self.default_config.disc_size, self.default_config.mode)
             self._refresh_disc_widgets()
+            
+            # Warn if any disc exceeds capacity
+            over_capacity = [d for d in self.discs if d.total_seconds > d.config.capacity_seconds]
+            if over_capacity:
+                QMessageBox.warning(self, "Over Capacity", 
+                    f"{len(over_capacity)} disc(s) exceed capacity with the new settings. "
+                    "Enable Auto-Split or remove tracks manually.")
 
     def _toggle_auto_split(self, checked: bool):
         """Toggle auto-split mode."""
@@ -1067,7 +1167,11 @@ class MiniDiscBatchBurner(QMainWindow):
 
     def _on_disc_complete(self, disc_idx: int):
         """Handle disc completion."""
-        if disc_idx < len(self.discs):
+        is_last_disc = disc_idx >= len(self.discs) - 1
+        
+        # Only update widget to COMPLETE for the last disc
+        # Non-last discs are already set to WAITING_FOR_DISC by the worker
+        if is_last_disc and disc_idx < len(self.discs):
             widget = self.discs_layout.itemAt(disc_idx).widget()
             if widget:
                 widget.update_status(DiscStatus.COMPLETE)
@@ -1077,9 +1181,7 @@ class MiniDiscBatchBurner(QMainWindow):
 
         # Check if more discs to process
         if disc_idx < len(self.discs) - 1:
-            # Show disc swap dialog
-            self.burn_worker.pause()
-
+            # Worker already paused itself - just show dialog
             dialog = DiscSwapDialog(disc_idx + 1, self)
             if dialog.exec() == QDialog.Accepted:
                 self.burn_worker.resume()
@@ -1089,6 +1191,8 @@ class MiniDiscBatchBurner(QMainWindow):
                     widget = self.discs_layout.itemAt(disc_idx + 1).widget()
                     if widget:
                         widget.update_status(DiscStatus.READY)
+            else:
+                self.burn_worker.stop()
 
     def _on_burning_complete(self):
         """Handle burning completion."""
@@ -1187,6 +1291,13 @@ class MiniDiscBatchBurner(QMainWindow):
                 event.ignore()
         else:
             event.accept()
+        
+        # Stop device checker thread
+        if hasattr(self, 'device_checker') and self.device_checker:
+            self.device_checker.stop()
+        
+        # Stop helper process
+        helper.stop()
 
 
 # =============================================================================

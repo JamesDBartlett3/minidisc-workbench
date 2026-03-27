@@ -108,20 +108,28 @@ DISC_SIZES: List[int] = [60, 74, 80]  # minutes
 MODE_MULTIPLIERS: dict[str, int] = {"SP": 1, "LP2": 2, "LP4": 4}
 
 # MiniDisc cluster geometry.  A cluster is the minimum allocation unit
-# on a MiniDisc: 32 data sectors × 2332 bytes = 74 624 bytes, holding
-# 176 sound groups × 11.6 ms = 2.0416 s of SP stereo audio.  In LP2
-# and LP4 the same physical cluster holds proportionally more audio
-# time (×2 / ×4).  Every track must start on a cluster boundary, so
-# the unused tail of its last cluster is wasted.
-CLUSTER_SP_SECONDS: float = 176 * 0.0116  # ≈ 2.0416 s
+# on a MiniDisc: 32 data sectors × 11 sound-groups/sector = 352 sound
+# groups.  Each sound group holds 512 PCM samples at 44 100 Hz.  For
+# stereo SP, one cluster = 176 stereo frames × 512 samples = 90 112
+# samples → 90112 / 44100 ≈ 2.04290 s.  In LP2 and LP4 the same
+# physical cluster holds proportionally more audio time (×2 / ×4).
+# Every track must start on a cluster boundary, so the unused tail of
+# its last cluster is wasted.
+#
+# Note: Track titles / metadata are stored in the disc's UTOC — a
+# fixed, separate area — and do NOT consume audio recording space.
+# See https://www.minidisc.org/md_toc.html (UTOC Sector #1).
+CLUSTER_SP_SECONDS: float = 90112 / 44100  # = 2.042902… s
 
-# Additional per-track overhead (in SP seconds) for UTOC entries and
-# inter-track boundary structures on the physical disc.  This is on
-# top of the cluster-alignment waste computed from each track's actual
-# duration.  Scales with recording mode (×2 LP2, ×4 LP4) because the
-# same physical overhead consumes more recording-time seconds in
-# compressed modes.
-TRACK_METADATA_SP_SECONDS: float = 0.3
+# UTOC title constraints.  UTOC Sector #1 stores track names in an
+# array of 256 "titlecell" slots (7 ASCII characters + 1 link byte
+# each).  Slot 0 holds the disc title pointer; the remaining 255 slots
+# are shared by all track titles and the disc title itself.  A title
+# that is N characters long consumes ceil(N / 7) cells.
+# See https://www.minidisc.org/md_toc.html (UTOC Sector #1).
+UTOC_TITLE_CELLS: int = 255          # usable titlecell slots
+UTOC_CHARS_PER_CELL: int = 7
+UTOC_MAX_CHARS: int = UTOC_TITLE_CELLS * UTOC_CHARS_PER_CELL  # 1785
 
 AUDIO_EXTENSIONS = {
     ".mp3", ".flac", ".wav", ".m4a", ".ogg",
@@ -177,6 +185,23 @@ class Track:
             return f"{self.artist} \u2013 {self.title}"
         return self.title
 
+    @property
+    def md_title(self) -> str:
+        """Title string as it would be written to a MiniDisc UTOC.
+
+        Returns ``"Artist - Title"`` when both are present, else just the
+        title.  This mirrors common MD burning software behaviour.
+        """
+        if self.artist:
+            return f"{self.artist} - {self.title}"
+        return self.title
+
+    @property
+    def md_title_cells(self) -> int:
+        """Number of UTOC titlecells consumed by this track's title."""
+        n = len(self.md_title)
+        return math.ceil(n / UTOC_CHARS_PER_CELL) if n > 0 else 0
+
 
 @dataclass
 class DiscConfig:
@@ -210,11 +235,6 @@ class Disc:
         """Duration of one cluster in the current recording mode."""
         return CLUSTER_SP_SECONDS * MODE_MULTIPLIERS.get(self.config.mode, 1)
 
-    @property
-    def track_overhead_seconds(self) -> float:
-        """Per-track metadata overhead in the current recording mode."""
-        return TRACK_METADATA_SP_SECONDS * MODE_MULTIPLIERS.get(self.config.mode, 1)
-
     def cluster_waste_for(self, track: Track) -> float:
         """Wasted seconds from cluster alignment for a single track."""
         cs = self.cluster_seconds
@@ -227,14 +247,9 @@ class Disc:
         return sum(self.cluster_waste_for(t) for t in self.tracks)
 
     @property
-    def total_overhead_seconds(self) -> float:
-        """Total per-track metadata overhead across all tracks."""
-        return len(self.tracks) * self.track_overhead_seconds
-
-    @property
     def effective_seconds(self) -> float:
-        """Total disc usage: audio + cluster waste + metadata overhead."""
-        return self.total_seconds + self.total_waste_seconds + self.total_overhead_seconds
+        """Total disc usage: audio + cluster waste."""
+        return self.total_seconds + self.total_waste_seconds
 
     @property
     def remaining_seconds(self) -> float:
@@ -248,6 +263,21 @@ class Disc:
     @property
     def is_over(self) -> bool:
         return self.effective_seconds > self.config.capacity_seconds
+
+    @property
+    def utoc_cells_used(self) -> int:
+        """Total UTOC titlecells consumed by all track titles on this disc."""
+        return sum(t.md_title_cells for t in self.tracks)
+
+    @property
+    def utoc_chars_used(self) -> int:
+        """Total title characters across all tracks on this disc."""
+        return sum(len(t.md_title) for t in self.tracks)
+
+    @property
+    def utoc_over(self) -> bool:
+        """True if track titles exceed the UTOC Sector #1 capacity."""
+        return self.utoc_cells_used > UTOC_TITLE_CELLS
 
 
 @dataclass
@@ -368,7 +398,7 @@ def split_sequential(
 
     for track in tracks:
         cap = current.config.capacity_seconds
-        track_cost = track.duration_seconds + current.cluster_waste_for(track) + current.track_overhead_seconds
+        track_cost = track.duration_seconds + current.cluster_waste_for(track)
         new_effective = current.effective_seconds + track_cost
         if current.tracks and new_effective > cap:
             discs.append(current)
@@ -402,7 +432,7 @@ def split_optimized(
     for track in sorted_tracks:
         placed = False
         for disc in discs:
-            track_cost = track.duration_seconds + disc.cluster_waste_for(track) + disc.track_overhead_seconds
+            track_cost = track.duration_seconds + disc.cluster_waste_for(track)
             new_effective = disc.effective_seconds + track_cost
             if new_effective <= disc.config.capacity_seconds:
                 disc.tracks.append(track)
@@ -587,9 +617,9 @@ class ResizeToFitDialog(QDialog):
         layout.addWidget(info)
 
         # --- Speed factor preview ---
-        total_audio = self.disc.total_seconds
-        target = self.disc.config.capacity_seconds
-        factor = total_audio / target if target > 0 else 1.0
+        factor = PlaylistSplitterApp._iterative_speed_factor(
+            self.disc.tracks, self.disc.config, 1,
+        )
         pct = (factor - 1) * 100
         self._factor_label = QLabel(
             f"Required speed factor: <b>{factor:.4f}×</b> ({pct:.2f}% faster)"
@@ -706,19 +736,16 @@ class CapacityBar(QWidget):
         self._tracks: List[Track] = []
         self._capacity: float = 74 * 60
         self._cluster_seconds: float = CLUSTER_SP_SECONDS
-        self._track_overhead: float = TRACK_METADATA_SP_SECONDS
         self.setFixedHeight(22)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_data(
         self, tracks: List[Track], capacity_seconds: float,
         cluster_seconds: float = CLUSTER_SP_SECONDS,
-        track_overhead: float = TRACK_METADATA_SP_SECONDS,
     ) -> None:
         self._tracks = tracks
         self._capacity = max(capacity_seconds, 1.0)
         self._cluster_seconds = cluster_seconds
-        self._track_overhead = track_overhead
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -734,16 +761,15 @@ class CapacityBar(QWidget):
         painter.drawRoundedRect(0, 0, w, h, 4, 4)
 
         cs = self._cluster_seconds
-        overhead = self._track_overhead
         total = sum(
-            math.ceil(t.duration_seconds / cs) * cs + overhead
+            math.ceil(t.duration_seconds / cs) * cs
             for t in self._tracks
         )
 
-        # Draw each track as a coloured segment (includes cluster waste + overhead)
+        # Draw each track as a coloured segment (includes cluster waste)
         x = 0.0
         for i, track in enumerate(self._tracks):
-            aligned = math.ceil(track.duration_seconds / cs) * cs + overhead
+            aligned = math.ceil(track.duration_seconds / cs) * cs
             frac = aligned / self._capacity
             seg_w = frac * w
             colour = TRACK_COLOURS[i % len(TRACK_COLOURS)]
@@ -896,6 +922,16 @@ class DiscWidget(QFrame):
         self._track_list.rows_reordered.connect(self._on_rows_reordered)
         layout.addWidget(self._track_list)
 
+        # --- UTOC title warning (hidden by default) ---
+        self._utoc_warning = QLabel()
+        self._utoc_warning.setWordWrap(True)
+        self._utoc_warning.setStyleSheet(
+            "color: #f9e2af; background-color: #45475a; padding: 4px 8px; "
+            "border-radius: 4px; font-size: 11px;"
+        )
+        self._utoc_warning.hide()
+        layout.addWidget(self._utoc_warning)
+
         # --- Config selectors ---
         config_row = QHBoxLayout()
         config_row.addWidget(QLabel("Disc:"))
@@ -984,7 +1020,7 @@ class DiscWidget(QFrame):
 
         self._capacity_bar.set_data(
             disc.tracks, disc.config.capacity_seconds,
-            disc.cluster_seconds, disc.track_overhead_seconds,
+            disc.cluster_seconds,
         )
 
         # Refresh track list items
@@ -997,6 +1033,20 @@ class DiscWidget(QFrame):
 
         # Show Resize-to-Fit button only when disc is over capacity
         self._resize_btn.setVisible(disc.is_over and _RESIZE_AVAILABLE)
+
+        # UTOC title limit warning
+        if disc.utoc_over:
+            cells = disc.utoc_cells_used
+            chars = disc.utoc_chars_used
+            self._utoc_warning.setText(
+                f"\u26a0 Track titles exceed MiniDisc UTOC limit: "
+                f"{cells}/{UTOC_TITLE_CELLS} cells, "
+                f"{chars}/{UTOC_MAX_CHARS} chars. "
+                f"Titles may be truncated on the disc."
+            )
+            self._utoc_warning.show()
+        else:
+            self._utoc_warning.hide()
 
     # ---- Resize to Fit ----
 
@@ -1016,12 +1066,12 @@ class DiscWidget(QFrame):
         if not input_files:
             return
 
-        # Calculate the speed factor from raw audio seconds vs disc capacity
-        total_audio = self.disc.total_seconds
-        target = self.disc.config.capacity_seconds
-        if target <= 0 or total_audio <= target:
+        # Calculate the speed factor from post-resize cluster waste
+        speed_factor = PlaylistSplitterApp._iterative_speed_factor(
+            self.disc.tracks, self.disc.config, 1,
+        )
+        if speed_factor <= 1.0:
             return
-        speed_factor = total_audio / target
 
         # Create disc subfolder (e.g., "Disc 01 of 03")
         window = self.window()
@@ -1541,13 +1591,25 @@ class PlaylistSplitterApp(QMainWindow):
             f"{count}\u00d7 {label}" for label, count in sorted(shopping.items())
         )
 
-        self._summary_label.setText(
+        # UTOC warnings
+        utoc_warnings = [
+            i + 1 for i, d in enumerate(discs) if d.utoc_over
+        ]
+
+        summary = (
             f"{len(discs)} disc(s)  \u2502  "
             f"{total_tracks} track(s)  \u2502  "
             f"{format_duration(total_eff)} total  \u2502  "
             f"{efficiency:.1f}% efficiency  \u2502  "
             f"Shopping list: {shopping_str}"
         )
+        if utoc_warnings:
+            disc_nums = ", ".join(str(n) for n in utoc_warnings)
+            summary += (
+                f"  \u2502  \u26a0 UTOC title limit exceeded on "
+                f"disc{'s' if len(utoc_warnings) > 1 else ''} {disc_nums}"
+            )
+        self._summary_label.setText(summary)
 
         # Use the natural disc count for the spinner range so the user can
         # go back to the original split after previewing a lower target.
@@ -1593,6 +1655,55 @@ class PlaylistSplitterApp(QMainWindow):
 
     # ---- Cross-disc "Resize Playlist" ----
 
+    @staticmethod
+    def _iterative_speed_factor(
+        tracks: "List[Track]", cfg: DiscConfig, target: int,
+        max_iterations: int = 20,
+    ) -> float:
+        """Compute the speed factor that makes *tracks* fit on *target* discs.
+
+        The key insight: cluster waste depends on post-resize durations, which
+        depend on the speed factor — a circular dependency.  We solve it by
+        iterating: compute an initial factor from raw totals, then refine by
+        recomputing cluster waste with predicted (post-resize) durations until
+        the factor converges.
+        """
+        total_raw = sum(t.duration_seconds for t in tracks)
+        total_cap = cfg.capacity_seconds * target
+        if total_cap <= 0 or total_raw <= 0:
+            return 2.0
+
+        cs = CLUSTER_SP_SECONDS * MODE_MULTIPLIERS.get(cfg.mode, 1)
+
+        # Initial guess: assume no overhead
+        factor = total_raw / total_cap
+        if factor < 1.0:
+            factor = 1.0
+
+        for _ in range(max_iterations):
+            # Compute cluster waste using post-resize durations
+            waste = 0.0
+            for t in tracks:
+                d = t.duration_seconds / factor
+                remainder = d % cs
+                if remainder > 0:
+                    waste += cs - remainder
+
+            available = total_cap - waste
+            if available <= 0:
+                factor *= 2.0
+                continue
+
+            new_factor = total_raw / available
+            if new_factor < 1.0:
+                new_factor = 1.0
+
+            if abs(new_factor - factor) < 1e-9:
+                break
+            factor = new_factor
+
+        return factor
+
     def _on_target_changed(self, value: int) -> None:
         """React to the user changing the target disc spinner."""
         nat = self._natural_disc_count
@@ -1611,18 +1722,7 @@ class PlaylistSplitterApp(QMainWindow):
             return
 
         cfg = self._default_config()
-        total_raw = sum(t.duration_seconds for t in all_tracks)
-
-        # Compute speed factor accounting for overhead
-        temp_disc = Disc(config=cfg)
-        overhead = sum(
-            temp_disc.cluster_waste_for(t) + temp_disc.track_overhead_seconds
-            for t in all_tracks
-        )
-        available = cfg.capacity_seconds * target - overhead
-        speed_factor = total_raw / available if available > 0 else 2.0
-        if speed_factor < 1.0:
-            speed_factor = 1.0
+        speed_factor = self._iterative_speed_factor(all_tracks, cfg, target)
 
         # Bin-pack using predicted durations into target discs
         discs = [Disc(config=cfg) for _ in range(target)]
@@ -1634,20 +1734,10 @@ class PlaylistSplitterApp(QMainWindow):
                 album=track.album, duration_seconds=predicted_dur,
             )
             td = discs[bin_idx]
-            track_cost = (
-                predicted_dur
-                + td.cluster_waste_for(predicted_track)
-                + td.track_overhead_seconds
-            )
+            track_cost = predicted_dur + td.cluster_waste_for(predicted_track)
             cap = td.config.capacity_seconds
             if td.tracks and bin_idx + 1 < target:
-                # Check if this track would overflow the current bin
-                current_used = sum(
-                    t.duration_seconds / speed_factor
-                    + td.cluster_waste_for(t)
-                    + td.track_overhead_seconds
-                    for t in td.tracks
-                )
+                current_used = td.effective_seconds
                 if current_used + track_cost > cap:
                     bin_idx += 1
                     td = discs[bin_idx]
@@ -1675,23 +1765,8 @@ class PlaylistSplitterApp(QMainWindow):
 
         all_tracks = [t for dw in self._disc_widgets for t in dw.disc.tracks]
         cfg = self._default_config()
-        total_raw = sum(t.duration_seconds for t in all_tracks)
-        total_cap = cfg.capacity_seconds * target
 
-        # Account for cluster waste + metadata overhead
-        temp_disc = Disc(config=cfg)
-        overhead = sum(
-            temp_disc.cluster_waste_for(t) + temp_disc.track_overhead_seconds
-            for t in all_tracks
-        )
-        available = total_cap - overhead
-        if available <= 0:
-            self._factor_label.setText(
-                "<span style='color:#f38ba8;'>Cannot fit — overhead alone exceeds capacity.</span>"
-            )
-            return
-
-        speed_factor = total_raw / available
+        speed_factor = self._iterative_speed_factor(all_tracks, cfg, target)
         if speed_factor <= 1.0:
             self._factor_label.setText(
                 "<span style='color:#a6e3a1;'>Tracks already fit on "
@@ -1720,19 +1795,8 @@ class PlaylistSplitterApp(QMainWindow):
             return
 
         cfg = self._default_config()
-        total_raw = sum(t.duration_seconds for t in all_tracks)
-        total_cap = cfg.capacity_seconds * target_count
 
-        temp_disc = Disc(config=cfg)
-        overhead = sum(
-            temp_disc.cluster_waste_for(t) + temp_disc.track_overhead_seconds
-            for t in all_tracks
-        )
-        available = total_cap - overhead
-        if available <= 0:
-            QMessageBox.warning(self, "Cannot fit", "Overhead alone exceeds capacity.")
-            return
-        speed_factor = total_raw / available
+        speed_factor = self._iterative_speed_factor(all_tracks, cfg, target_count)
         if speed_factor <= 1.0:
             QMessageBox.information(
                 self, "No resize needed",
@@ -1760,7 +1824,7 @@ class PlaylistSplitterApp(QMainWindow):
             sub = Path(base_output) / f"Disc {i + 1:0{pad}d} of {target_count:0{pad}d}"
             disc_bins.append((sub, [], 0.0))
 
-        # Build a temporary Disc per target slot to reuse cluster/overhead math
+        # Build a temporary Disc per target slot to reuse cluster math
         temp_discs = [Disc(config=cfg) for cfg in target_configs]
         bin_idx = 0
         for track in all_tracks:
@@ -1770,25 +1834,37 @@ class PlaylistSplitterApp(QMainWindow):
                 album=track.album, duration_seconds=predicted_dur,
             )
             td = temp_discs[bin_idx]
-            track_cost = (
-                predicted_dur
-                + td.cluster_waste_for(predicted_track)
-                + td.track_overhead_seconds
-            )
+            track_cost = predicted_dur + td.cluster_waste_for(predicted_track)
             cap = td.config.capacity_seconds
             # Move to next disc if this one would overflow (and there is a next)
             if td.tracks and disc_bins[bin_idx][2] + track_cost > cap and bin_idx + 1 < target_count:
                 bin_idx += 1
                 td = temp_discs[bin_idx]
-                track_cost = (
-                    predicted_dur
-                    + td.cluster_waste_for(predicted_track)
-                    + td.track_overhead_seconds
-                )
+                track_cost = predicted_dur + td.cluster_waste_for(predicted_track)
             td.tracks.append(predicted_track)
             sub, files, used = disc_bins[bin_idx]
             files.append(Path(track.path))
             disc_bins[bin_idx] = (sub, files, used + track_cost)
+
+        # Check UTOC title limits on each target disc
+        utoc_over_discs = [
+            i + 1 for i, td in enumerate(temp_discs)
+            if td.tracks and td.utoc_over
+        ]
+        if utoc_over_discs:
+            disc_nums = ", ".join(str(n) for n in utoc_over_discs)
+            answer = QMessageBox.warning(
+                self, "UTOC title limit exceeded",
+                f"Disc{'s' if len(utoc_over_discs) > 1 else ''} {disc_nums} "
+                f"will exceed the MiniDisc UTOC title limit "
+                f"({UTOC_TITLE_CELLS} cells / {UTOC_MAX_CHARS} chars). "
+                f"Track titles may be truncated on the disc.\n\n"
+                f"Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
 
         # Create subfolders and drop empties
         disc_groups: list[tuple[Path, list[Path]]] = []

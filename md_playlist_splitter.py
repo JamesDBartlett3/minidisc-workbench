@@ -1656,53 +1656,83 @@ class PlaylistSplitterApp(QMainWindow):
     # ---- Cross-disc "Resize Playlist" ----
 
     @staticmethod
+    def _simulate_disc_layout(
+        tracks: "List[Track]",
+        speed_factor: float,
+        cfg: DiscConfig,
+        target: int,
+    ) -> bool:
+        """Return ``True`` if *tracks* fit on *target* discs at *speed_factor*.
+
+        Simulates sequential packing with per-track cluster-alignment waste,
+        including real disc-boundary transitions.
+        """
+        cs = CLUSTER_SP_SECONDS * MODE_MULTIPLIERS.get(cfg.mode, 1)
+        cap = cfg.capacity_seconds
+        disc_used = 0.0
+        disc_idx = 0
+
+        for track in tracks:
+            dur = track.duration_seconds / speed_factor
+            remainder = dur % cs
+            waste = (cs - remainder) if remainder > 0 else 0.0
+            cost = dur + waste
+
+            # Current disc would overflow — advance to the next one
+            if disc_used > 0 and disc_used + cost > cap:
+                disc_idx += 1
+                if disc_idx >= target:
+                    return False
+                disc_used = 0.0
+
+            disc_used += cost
+            # A single track may exceed an entire disc's capacity
+            if disc_used > cap:
+                return False
+
+        return True
+
+    @staticmethod
     def _iterative_speed_factor(
         tracks: "List[Track]", cfg: DiscConfig, target: int,
-        max_iterations: int = 20,
     ) -> float:
         """Compute the speed factor that makes *tracks* fit on *target* discs.
 
-        The key insight: cluster waste depends on post-resize durations, which
-        depend on the speed factor — a circular dependency.  We solve it by
-        iterating: compute an initial factor from raw totals, then refine by
-        recomputing cluster waste with predicted (post-resize) durations until
-        the factor converges.
+        Starts from no shrinkage (1.0×) and walks the factor upward in
+        small steps, simulating the full disc layout at each candidate.
+        Because cluster-boundary effects can make fit results non-monotonic,
+        require 3 consecutive passing simulations before accepting a factor.
         """
         total_raw = sum(t.duration_seconds for t in tracks)
         total_cap = cfg.capacity_seconds * target
         if total_cap <= 0 or total_raw <= 0:
             return 2.0
 
-        cs = CLUSTER_SP_SECONDS * MODE_MULTIPLIERS.get(cfg.mode, 1)
+        sim = PlaylistSplitterApp._simulate_disc_layout
 
-        # Initial guess: assume no overhead
-        factor = total_raw / total_cap
-        if factor < 1.0:
-            factor = 1.0
+        # Already fits without any resizing?
+        if sim(tracks, 1.0, cfg, target):
+            return 1.0
 
-        for _ in range(max_iterations):
-            # Compute cluster waste using post-resize durations
-            waste = 0.0
-            for t in tracks:
-                d = t.duration_seconds / factor
-                remainder = d % cs
-                if remainder > 0:
-                    waste += cs - remainder
+        step = 0.0005
 
-            available = total_cap - waste
-            if available <= 0:
-                factor *= 2.0
-                continue
+        # Naive factor (ignoring cluster waste) — use as starting point
+        factor = max(total_raw / total_cap, 1.0 + step)
 
-            new_factor = total_raw / available
-            if new_factor < 1.0:
-                new_factor = 1.0
+        # Walk upward until we observe 3 consecutive passes.
+        # This is equivalent to adding a 2-step safety margin while also
+        # guarding against pass/fail jitter from cluster quantization.
+        consecutive_passes = 0
+        while factor <= 10.0:
+            if sim(tracks, factor, cfg, target):
+                consecutive_passes += 1
+                if consecutive_passes >= 3:
+                    return factor
+            else:
+                consecutive_passes = 0
+            factor = round(factor + step, 6)
 
-            if abs(new_factor - factor) < 1e-9:
-                break
-            factor = new_factor
-
-        return factor
+        return factor  # pathological — bail out
 
     def _on_target_changed(self, value: int) -> None:
         """React to the user changing the target disc spinner."""
